@@ -3,13 +3,24 @@ from discord.ext import commands
 from discord.ui import Button, View, Select
 import os
 import json
+import threading
+import asyncio
+import stripe
 from dotenv import load_dotenv
 from pymongo import MongoClient
+from flask import Flask, request, jsonify
 
 # Load environment variables
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
 MONGO_URI = os.getenv('MONGO_URI')
+STRIPE_SECRET = os.getenv('STRIPE_SECRET')   # Webhook Secret (whsec_...)
+SELLAPP_SECRET = os.getenv('SELLAPP_SECRET') 
+STRIPE_API_KEY = os.getenv('STRIPE_API_KEY') # API Key (sk_live_...)
+
+# Configure Stripe
+if STRIPE_API_KEY:
+    stripe.api_key = STRIPE_API_KEY
 
 # Database Setup
 if not MONGO_URI:
@@ -31,6 +42,98 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 bot = commands.Bot(command_prefix='!', intents=intents)
+
+# Flask Setup
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is Online!"
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """
+    Unified Webhook Listener:
+    1. Stripe Webhooks (checkout.session.completed)
+    2. SellApp Webhooks
+    """
+    payload = request.data
+    sig_header = request.headers.get('Stripe-Signature')
+
+    # --- STRIPE HANDLER ---
+    if sig_header and STRIPE_SECRET:
+        try:
+            event = stripe.Webhook.construct_event(
+                payload, sig_header, STRIPE_SECRET
+            )
+        except ValueError as e:
+            return jsonify({"error": "Invalid payload"}), 400
+        except stripe.error.SignatureVerificationError as e:
+            return jsonify({"error": "Invalid signature"}), 400
+
+        if event['type'] == 'checkout.session.completed':
+            session = event['data']['object']
+            
+            # Get User ID and Product from Client Reference / Metadata
+            user_id = session.get('client_reference_id')
+            # Assuming product name is passed in metadata or we look up by price
+            # For simplicity, let's use metadata: {'product_name': 'VIP'}
+            metadata = session.get('metadata', {})
+            product_name = metadata.get('product_name')
+
+            if user_id and product_name:
+                print(f"✅ Stripe Payment: {product_name} for User {user_id}")
+                asyncio.run_coroutine_threadsafe(give_role_async(user_id, product_name), bot.loop)
+        
+        return jsonify({"status": "success"}), 200
+
+    # --- SELLAPP / CUSTOM HANDLER ---
+    data = request.json
+    if not data:
+        return jsonify({"error": "No data"}), 400
+    
+    secret_received = data.get('secret')
+    if SELLAPP_SECRET and secret_received == SELLAPP_SECRET:
+        product_name = data.get('product_name')
+        user_id = data.get('discord_user_id')
+        
+        if product_name and user_id:
+            print(f"✅ SellApp Payment: {product_name} for User {user_id}")
+            asyncio.run_coroutine_threadsafe(give_role_async(user_id, product_name), bot.loop)
+            return jsonify({"status": "success"}), 200
+
+    return jsonify({"error": "Unauthorized"}), 403
+
+async def give_role_async(user_id, product_name):
+    # Find Product Role
+    products = get_all_products()
+    if product_name not in products:
+        print(f"Webhook Error: Product {product_name} not found.")
+        return
+
+    role_id = products[product_name]['role_id']
+    
+    # Find Guild (Assuming bot is in 1 main guild, or you pass guild_id in webhook)
+    # For now, we iterate guilds to find the user
+    for guild in bot.guilds:
+        member = guild.get_member(int(user_id))
+        if member:
+            role = guild.get_role(role_id)
+            if role:
+                try:
+                    await member.add_roles(role)
+                    try:
+                        await member.send(f"🎉 Payment Received! You have been given the **{role.name}** role.")
+                    except:
+                        pass # DM closed
+                    print(f"Given role {role.name} to {member.name}")
+                except Exception as e:
+                    print(f"Failed to give role: {e}")
+            break
+
+def run_flask():
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
 
 # Helpers (MongoDB Wrappers)
 def get_all_products():
@@ -151,7 +254,11 @@ class ProductSelect(Select):
         final_payments = global_payments.copy()
         final_payments.update(specific_links)
         
-        if not final_payments:
+        # Check if we have ANY payment method (Manual OR Auto)
+        has_stripe_api = bool(STRIPE_API_KEY)
+        has_manual_links = bool(final_payments)
+        
+        if not has_stripe_api and not has_manual_links:
             await interaction.response.send_message("❌ No payment methods configured! Contact Admin.", ephemeral=True)
             return
 
@@ -164,11 +271,53 @@ class PaymentView(View):
         self.product_name = product_name
         self.price = price
         
+        # Check for Stripe API Integration
+        if STRIPE_API_KEY:
+            self.add_item(StripeCheckoutButton(product_name, price))
+
         for method, link in payments.items():
+            # Skip manual stripe link if API is active
+            if method.lower() == 'stripe' and STRIPE_API_KEY:
+                continue
             self.add_item(Button(label=f"Pay with {method}", url=link, style=discord.ButtonStyle.link))
         
-        # Add "I Paid" Button
+        # Add "I Paid" Button (Manual Fallback)
         self.add_item(PaidButton(product_name))
+
+class StripeCheckoutButton(Button):
+    def __init__(self, product_name, price):
+        super().__init__(label="💳 Pay with Stripe (Auto)", style=discord.ButtonStyle.primary)
+        self.product_name = product_name
+        self.price = price # String "10.00"
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        
+        try:
+            # Convert price string to cents (e.g. "10.00" -> 1000)
+            amount_cents = int(float(self.price) * 100)
+            
+            session = stripe.checkout.Session.create(
+                payment_method_types=['card', 'cashapp'],
+                line_items=[{
+                    'price_data': {
+                        'currency': 'usd',
+                        'product_data': {'name': self.product_name},
+                        'unit_amount': amount_cents,
+                    },
+                    'quantity': 1,
+                }],
+                mode='payment',
+                client_reference_id=str(interaction.user.id), # PASS USER ID HERE
+                metadata={'product_name': self.product_name}, # PASS PRODUCT NAME HERE
+                success_url='https://discord.com/channels/@me', # Redirect back to Discord
+                cancel_url='https://discord.com/channels/@me',
+            )
+            
+            await interaction.followup.send(f"Click here to pay securely: {session.url}", ephemeral=True)
+            
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error creating payment session: {str(e)}", ephemeral=True)
 
 class PaidButton(Button):
     def __init__(self, product_name):
@@ -253,6 +402,10 @@ async def store(ctx):
     await ctx.send(embed=embed, view=view)
 
 if TOKEN:
+    # Start Flask in a separate thread
+    t = threading.Thread(target=run_flask)
+    t.start()
+    
     bot.run(TOKEN)
 else:
     print("Error: DISCORD_TOKEN not found")
