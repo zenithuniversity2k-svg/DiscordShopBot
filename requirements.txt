@@ -1,5 +1,5 @@
 discord.py
 python-dotenv
 pymongo
-flask
+quart
 stripe

@@ -1,14 +1,14 @@
+
 import discord
 from discord.ext import commands
 from discord.ui import Button, View, Select
 import os
 import json
-import threading
 import asyncio
 import stripe
 from dotenv import load_dotenv
 from pymongo import MongoClient
-from flask import Flask, request, jsonify
+from quart import Quart, request, jsonify
 
 # Load environment variables
 load_dotenv()
@@ -43,21 +43,21 @@ intents.message_content = True
 intents.members = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# Flask Setup
-app = Flask(__name__)
+# Quart Setup
+app = Quart(__name__)
 
 @app.route('/')
-def home():
+async def home():
     return "Bot is Online!"
 
 @app.route('/webhook', methods=['POST'])
-def webhook():
+async def webhook():
     """
     Unified Webhook Listener:
     1. Stripe Webhooks (checkout.session.completed)
     2. SellApp Webhooks
     """
-    payload = request.data
+    payload = await request.get_data()
     sig_header = request.headers.get('Stripe-Signature')
 
     # --- STRIPE HANDLER ---
@@ -83,12 +83,15 @@ def webhook():
 
             if user_id and product_name:
                 print(f"✅ Stripe Payment: {product_name} for User {user_id}")
-                asyncio.run_coroutine_threadsafe(give_role_async(user_id, product_name), bot.loop)
+                # Since we are in the same loop, we can just await the function if it was async,
+                # but give_role_async is designed to be thread-safe for old flask.
+                # Here we can just call it directly if we ensure it's async.
+                await give_role_async(user_id, product_name)
         
         return jsonify({"status": "success"}), 200
 
     # --- SELLAPP / CUSTOM HANDLER ---
-    data = request.json
+    data = await request.get_json()
     if not data:
         return jsonify({"error": "No data"}), 400
     
@@ -99,7 +102,7 @@ def webhook():
         
         if product_name and user_id:
             print(f"✅ SellApp Payment: {product_name} for User {user_id}")
-            asyncio.run_coroutine_threadsafe(give_role_async(user_id, product_name), bot.loop)
+            await give_role_async(user_id, product_name)
             return jsonify({"status": "success"}), 200
 
     return jsonify({"error": "Unauthorized"}), 403
@@ -130,10 +133,6 @@ async def give_role_async(user_id, product_name):
                 except Exception as e:
                     print(f"Failed to give role: {e}")
             break
-
-def run_flask():
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
 
 # Helpers (MongoDB Wrappers)
 def get_all_products():
@@ -374,8 +373,7 @@ class TicketAdminView(View):
             await member.add_roles(role)
             await interaction.response.send_message(f"✅ Approved! {role.mention} given to {member.mention}.")
             await interaction.channel.send("Ticket will close in 5 seconds...")
-            import asyncio
-            await __import__('asyncio').sleep(5)
+            await asyncio.sleep(5)
             await interaction.channel.delete()
         else:
             await interaction.response.send_message("❌ Error: Role or Member not found.", ephemeral=True)
@@ -385,8 +383,6 @@ class TicketAdminView(View):
         if not interaction.user.guild_permissions.administrator:
             return
         await interaction.channel.delete()
-
-# --- MAIN COMMAND ---
 
 @bot.command(name='store')
 async def store(ctx):
@@ -401,11 +397,18 @@ async def store(ctx):
     embed = discord.Embed(title="🛒 Server Store", description="Select a product below to purchase.", color=discord.Color.blue())
     await ctx.send(embed=embed, view=view)
 
-if TOKEN:
-    # Start Flask in a separate thread
-    t = threading.Thread(target=run_flask)
-    t.start()
-    
-    bot.run(TOKEN)
-else:
-    print("Error: DISCORD_TOKEN not found")
+async def main():
+    async with bot:
+        # Start Quart in the background
+        bot.loop.create_task(app.run_task(host='0.0.0.0', port=int(os.environ.get("PORT", 5000))))
+        await bot.start(TOKEN)
+
+if __name__ == '__main__':
+    if TOKEN:
+        try:
+            asyncio.run(main())
+        except KeyboardInterrupt:
+            # Handle Ctrl+C gracefully
+            pass
+    else:
+        print("Error: DISCORD_TOKEN not found")
